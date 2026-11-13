@@ -4,11 +4,14 @@ services:
     env_file: .env
     ports:
       - "127.0.0.1:8000:8000"
-    depends_on:
-      - squid
     restart: unless-stopped
-  squid:
-    build: ./deploy/squid
-    volumes:
-      - ./deploy/squid.local.conf:/etc/squid/squid.conf:ro
+  browser:
+    profiles: [browser]
+    build:
+      context: .
+      dockerfile: browser/Dockerfile
+    environment:
+      GATEWAY_API_TOKEN: ${GATEWAY_BROWSER_TOKEN:?Set GATEWAY_BROWSER_TOKEN in .env}
+      GATEWAY_ALLOWED_DOMAINS: ${GATEWAY_ALLOWED_DOMAINS:?Set GATEWAY_ALLOWED_DOMAINS in .env}
+    shm_size: 256mb
     restart: unless-stopped

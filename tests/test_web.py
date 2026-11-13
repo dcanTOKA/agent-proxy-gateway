@@ -1,10 +1,12 @@
+import asyncio
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 from fastapi import HTTPException
 
-from app.config import Proxy, Settings
+from app.config import Settings
+from app.policy import is_public_address, resolve_target
 from app.web import WebClient
 
 
@@ -13,11 +15,12 @@ def web(monkeypatch):
     settings = Settings(
         _env_file=None,
         api_token="a" * 40,
-        proxies=[Proxy(name="one", url="http://10.40.2.10:3128")],
         allowed_domains=["example.com"],
         max_response_bytes=1024,
     )
-    monkeypatch.setattr("app.web.validate_target", AsyncMock(return_value="example.com"))
+    monkeypatch.setattr(
+        "app.web.resolve_target", AsyncMock(return_value=("example.com", "93.184.215.14"))
+    )
     return WebClient(settings)
 
 
@@ -33,37 +36,41 @@ def transport(monkeypatch, handler):
     return options
 
 
-async def test_fetch_always_uses_proxy_and_removes_scripts(web, monkeypatch):
-    options = transport(
-        monkeypatch,
-        lambda request: httpx.Response(
-            200,
-            headers={"content-type": "text/html"},
-            text="<h1>Hello</h1><script>bad()</script><p>World</p>",
-        ),
-    )
-    page = await web.fetch("https://example.com", web.settings.proxies[0])
-    assert page.text == "Hello\nWorld"
-    assert options[0]["proxy"] == "http://10.40.2.10:3128"
+async def test_connection_uses_validated_ip_with_original_host_and_sni(web, monkeypatch):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "text/html"}, text="<h1>Hello</h1><script>bad()</script>"
+        )
+
+    options = transport(monkeypatch, handler)
+    page = await web.fetch("https://example.com")
+    assert page.text == "Hello"
+    assert page.url == "https://example.com"
+    assert calls[0].url.host == "93.184.215.14"
+    assert calls[0].headers["host"] == "example.com"
+    assert calls[0].extensions["sni_hostname"] == "example.com"
     assert options[0]["trust_env"] is False
+    assert "proxy" not in options[0]
 
 
-async def test_redirect_target_revalidated(web, monkeypatch):
+async def test_redirect_target_is_revalidated(web, monkeypatch):
     transport(
         monkeypatch,
         lambda request: httpx.Response(
             302, headers={"location": "http://169.254.169.254/metadata"}
         ),
     )
-    check = AsyncMock(side_effect=["example.com", HTTPException(403, "blocked")])
-    monkeypatch.setattr("app.web.validate_target", check)
+    check = AsyncMock(side_effect=[("example.com", "93.184.215.14"), HTTPException(403, "blocked")])
+    monkeypatch.setattr("app.web.resolve_target", check)
     with pytest.raises(HTTPException) as error:
-        await web.fetch("https://example.com", web.settings.proxies[0])
+        await web.fetch("https://example.com")
     assert error.value.status_code == 403
-    assert check.call_args.args[0] == "http://169.254.169.254/metadata"
 
 
-async def test_provider_credentials_never_follow_redirect(web, monkeypatch):
+async def test_provider_credentials_do_not_follow_redirects(web, monkeypatch):
     calls = []
 
     def handler(request):
@@ -71,25 +78,17 @@ async def test_provider_credentials_never_follow_redirect(web, monkeypatch):
         return httpx.Response(302, headers={"location": "https://other.example/"})
 
     transport(monkeypatch, handler)
-    with pytest.raises(HTTPException) as error:
-        await web.fetch("https://example.com", web.settings.proxies[0], {"Secret": "key"})
-    assert error.value.status_code == 502
+    with pytest.raises(HTTPException):
+        await web.fetch("https://example.com", {"Secret": "key"})
     assert len(calls) == 1
 
 
-async def test_429_preserves_retry_after_without_rotation(web, monkeypatch):
-    calls = []
-
-    def handler(request):
-        calls.append(request)
-        return httpx.Response(429, headers={"retry-after": "120"})
-
-    transport(monkeypatch, handler)
+async def test_429_preserves_retry_after(web, monkeypatch):
+    transport(monkeypatch, lambda request: httpx.Response(429, headers={"retry-after": "120"}))
     with pytest.raises(HTTPException) as error:
-        await web.fetch("https://example.com", web.settings.proxies[0])
+        await web.fetch("https://example.com")
     assert error.value.status_code == 429
     assert error.value.headers["Retry-After"] == "120"
-    assert len(calls) == 1
 
 
 async def test_response_size_limit(web, monkeypatch):
@@ -100,19 +99,39 @@ async def test_response_size_limit(web, monkeypatch):
         ),
     )
     with pytest.raises(HTTPException) as error:
-        await web.fetch("https://example.com", web.settings.proxies[0])
+        await web.fetch("https://example.com")
     assert error.value.status_code == 413
 
 
-async def test_proxy_failure_has_no_direct_fallback(web, monkeypatch):
-    calls = []
+async def test_no_store_respected(web, monkeypatch):
+    transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200, headers={"content-type": "text/plain", "cache-control": "no-store"}, text="secret"
+        ),
+    )
+    assert (await web.fetch("https://example.com")).cacheable is False
 
-    def handler(request):
-        calls.append(request)
-        raise httpx.ConnectError("offline")
 
-    transport(monkeypatch, handler)
+@pytest.mark.parametrize(
+    "address", ["10.0.0.1", "127.0.0.1", "168.63.129.16", "169.254.169.254", "::ffff:127.0.0.1"]
+)
+def test_private_and_metadata_addresses_blocked(address):
+    assert not is_public_address(address)
+
+
+async def test_private_dns_answer_blocked(monkeypatch):
+    monkeypatch.setattr(
+        asyncio.get_running_loop(),
+        "getaddrinfo",
+        AsyncMock(return_value=[(2, 1, 6, "", ("10.0.0.1", 443))]),
+    )
     with pytest.raises(HTTPException) as error:
-        await web.fetch("https://example.com", web.settings.proxies[0])
-    assert error.value.status_code == 502
-    assert len(calls) == 1
+        await resolve_target("https://example.com", ["example.com"])
+    assert error.value.status_code == 403
+
+
+async def test_exact_domain_matching():
+    with pytest.raises(HTTPException) as error:
+        await resolve_target("https://example.com.evil.test", ["example.com"])
+    assert error.value.status_code == 403

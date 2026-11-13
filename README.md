@@ -1,176 +1,171 @@
 # Agent Gateway
 
-Kurumsal agent'ların web araması ve sayfa okuma isteklerini Azure üzerinden yöneten küçük bir FastAPI projesi. ProxyForge kodunu değiştirmez; FastAPI ve Azure için ayrı bir başlangıç uygulamasıdır.
+Kurumsal agent'lar için küçük, serverless web gateway. Normal sayfalar HTTP ile, JavaScript gereken sayfalar ayrı Chromium worker ile okunur. Arama bağımsız ve isteğe bağlıdır.
 
 ```mermaid
 flowchart LR
-    Agent[Kurumsal agent / tool] -->|HTTPS + Bearer token| LB[Azure Load Balancer]
-    LB --> API[FastAPI VM havuzu: 1..N]
-    API -->|Özel ağ| Squid[Squid VM havuzu: 1..N]
-    Squid --> IP[VM başına 1..4 public IP]
-    IP --> Web[İnternet / Brave Search API]
+    Agent[Kurumsal agent / tool] -->|HTTPS + token| API[ACA Consumption: FastAPI]
+    API --> Fetch[fetch-page: HTTP istemcisi]
+    API -->|Yalnızca gerektiğinde| Browser[ACA Consumption: Chromium worker]
+    API --> Search[web-search: isteğe bağlı sağlayıcı]
+    Fetch --> Web[İnternet]
+    Browser --> Web
+    Search --> Provider[Arama API'si]
     API <--> Policy[İçerik kontrolü bağlantı noktaları]
 ```
 
-Başlangıç: **1 API VM + 1 proxy VM**. Terraform ile iki grubun sayısı ayrı artırılır. API adresi load balancer sayesinde sabit kalır.
+## Başlangıç düzeni
 
-## Neler var?
+- API: 0.25 vCPU / 0.5 GiB, minimum 0 ve maksimum 2 replica.
+- Browser: isteğe bağlı ayrı Container App; 1 vCPU / 2 GiB, minimum 0 ve maksimum 1 replica.
+- Worker yalnızca aynı ACA ortamından erişilir ve ayrı token kullanır.
+- VM, Squid, NAT Gateway, ayrılmış public IP ve ayrı load balancer kurulmaz.
+- HTTPS adresini ACA sağlar. Sabit çıkış IP'si ve IP rotasyonu yoktur.
+- İki servis de sıfıra ölçeklenebilir. Ölçek düşmesi anlık değildir; açılış ve soğuma sürelerinde ücret oluşabilir. İlk istekte açılış gecikmesi vardır.
 
-- `POST /fetch-page`: HTML, metin veya JSON getirir. HTML içinden script/style çıkarır.
-- `POST /web-search`: Brave Search API üzerinden arama yapar. Kendi API anahtarın gerekir.
-- Bearer token, açık domain listesi, özel/rezerve IP engeli, redirect kontrolü.
-- Yanıt boyutu, zaman aşımı, eşzamanlılık ve dakikalık istek sınırı.
-- Round robin çıkış seçimi ve isteğe bağlı `session_id` ile aynı çıkışı koruma.
-- Sorgu içeriği ve sırları kaydetmeyen JSON erişim logları.
-- HTTPS, Docker, Terraform ve SSH üzerinden dağıtım betiği.
+Worker senkron HTTP yanıtı verdiği için ACA Job yerine ayrı Container App kullanılır. Her render için browser/context açılır ve sonunda kapatılır. Worker varsayılan olarak **kurulmaz**; `enable_browser = true` ile açılır. Normal fetch otomatik olarak Chromium'a geçmez.
 
-`app/policy.py` içindeki `inspect_input` ve `inspect_output` şu an boş bağlantı noktalarıdır. Content Safety, DLP veya prompt injection modeli **henüz bağlı değildir**. `untrusted_content: true`, dönen içeriğin agent tarafından talimat olarak kabul edilmemesi gerektiğini belirtir; bir güvenlik taraması sonucu değildir.
+## Endpoint'ler
+
+| Endpoint | Davranış |
+|---|---|
+| `GET /healthz` | Uygulama sağlık kontrolü |
+| `POST /fetch-page` | HTTP ile HTML/metin/JSON getirir; script ve style çıkarılır |
+| `POST /browse-page` | Ayrı worker'da JavaScript çalıştırıp görünen metni getirir |
+| `POST /web-search` | Yapılandırılmış arama sağlayıcısını çağırır |
+
+Sayfa endpoint'leri `{"url":"https://example.com"}`; arama `{"query":"Azure","max_results":5}` gövdesini alır. POST endpoint'leri `Authorization: Bearer <token>` ister.
+
+Web içeriği `untrusted_content: true` olarak döner. Bu, bir modelin içeriği güvenli bulduğu anlamına gelmez; içerik agent için güvenilmeyen kaynak verisidir.
 
 ## Yerelde çalıştır
 
-Gerekenler: Python 3.12+, [uv](https://docs.astral.sh/uv/), Docker Compose.
+Gerekenler: Python 3.12+, uv ve Docker Compose.
 
 ```bash
 cp .env.example .env
 python -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
 
-Ürettiğin token'ı `.env` dosyasındaki `GATEWAY_API_TOKEN` değerine yaz. Arama için `GATEWAY_SEARCH_API_KEY` ekle.
+Token'ı `.env` içindeki `GATEWAY_API_TOKEN` alanına yaz. Browser için farklı bir token üretip `GATEWAY_BROWSER_TOKEN` alanına yaz.
+
+Yalnızca API/fetch:
 
 ```bash
-docker compose up -d --build
+docker compose up -d --build api
 ```
 
-API yalnızca `127.0.0.1:8000` üzerinde açılır. Swagger: `http://127.0.0.1:8000/docs`.
+Chromium da çalışsın:
 
 ```bash
-export GATEWAY_API_TOKEN='env-dosyasina-yazdigin-token'
+docker compose --profile browser up -d --build
+```
 
+```bash
+export GATEWAY_API_TOKEN='env-dosyasindaki-token'
 curl http://127.0.0.1:8000/fetch-page \
   -H "Authorization: Bearer $GATEWAY_API_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"url":"https://example.com","session_id":"agent-1"}'
-
-curl http://127.0.0.1:8000/web-search \
-  -H "Authorization: Bearer $GATEWAY_API_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"Azure FastAPI","max_results":5}'
+  -d '{"url":"https://example.com"}'
 ```
 
-Yerel açık domain listesini değiştirirken hem `.env` içindeki `GATEWAY_ALLOWED_DOMAINS` hem `deploy/squid.local.conf` içindeki `allowed_domains` satırını güncelle. Tam domain eşleşmesi kullanılır; `example.com` izni alt domain'leri kapsamaz. `docker compose up -d --force-recreate` ile yeniden yükle.
+JavaScript için aynı isteği `/browse-page` adresine gönder. Swagger: `http://127.0.0.1:8000/docs`.
 
-## Azure altyapısını kur
+## Web araması
 
-Gerekenler: Terraform 1.9+, Azure CLI, SSH anahtarı ve Azure aboneliği. Bu adımlar ücretli Azure kaynakları oluşturur.
+Başlangıçta kapalıdır. Açmak için `.env` içinde:
+
+```dotenv
+GATEWAY_SEARCH_PROVIDER=brave
+GATEWAY_SEARCH_API_KEY=your-key
+```
+
+`api.search.brave.com` açık domain listesinde olmalıdır. Brave zorunlu değildir; mevcut tek hazır adaptördür. Yeni sağlayıcılar `app/search.py` içine eklenebilir. Playwright ile arama motoru sayfası açmak hazır search adaptörü değildir; CAPTCHA, engeller ve HTML ayrıştırması ayrıca ele alınmalıdır.
+
+Aramanın ayrı dakika limiti vardır; bu, sağlayıcı hesabındaki harcama tavanının yerine geçmez.
+
+## Azure dağıtımı
+
+Gerekenler: Terraform 1.9+, Azure CLI, Docker ve yayınlayabileceğin bir container registry.
+
+### Image'ları yayınla
+
+Registry'ye kendi hesabınla giriş yap. Script varsayılan olarak yalnızca API image'ını build edip pushlar:
+
+```bash
+sh scripts/build_images.sh ghcr.io/dcantoka/agent-proxy-gateway 0.2.0
+```
+
+Browser da gerekiyorsa:
+
+```bash
+sh scripts/build_images.sh ghcr.io/dcantoka/agent-proxy-gateway 0.2.0 --with-browser
+```
+
+Terraform örneği **public** GHCR image'ları kullanır. Image'ları yayınlamadan Terraform apply çalışmaz. GHCR package görünürlüğünü public yap; sırları image'a ekleme. Bu repository güncellemesi kendi başına GHCR image yayınlamaz. ACR/özel registry kullanacaksan registry kimlik doğrulaması ayrıca eklenmelidir. Üretimde immutable tag veya digest kullan.
+
+### Terraform
 
 ```bash
 az login
+az provider register --namespace Microsoft.App
 cp infra/terraform.tfvars.example infra/terraform.tfvars
 ```
 
-`terraform.tfvars` içindeki abonelik, SSH public key ve CIDR değerlerini değiştir. `client_cidrs`, kurumsal ağın Azure'a çıkarken kullandığı public IP aralıklarıdır. `admin_cidrs`, SSH bağlantısını yapacağın ağın public IP aralıklarıdır. Örnek IP'ler dokümantasyon içindir; gerçek erişim sağlamaz.
+Abonelik, image ve kurumsal public çıkış CIDR'larını değiştir. `203.0.113.20/32` yalnızca örnektir; `client_cidrs` dışındaki adresler API ingress'inden erişemez.
 
 ```bash
+export TF_VAR_api_token='en-az-32-karakter-rastgele-token'
 terraform -chdir=infra init
 terraform -chdir=infra plan -out=deployment.tfplan
 terraform -chdir=infra apply deployment.tfplan
-mkdir -p work
-terraform -chdir=infra output -json deployment > work/inventory.json
-terraform -chdir=infra output -raw gateway_ip
+terraform -chdir=infra output -raw gateway_url
 ```
 
-Domain'inin A kaydını `gateway_ip` adresine yönlendir. O domain için kurum CA'ndan veya bir sertifika sağlayıcısından PEM sertifikası ve anahtarı al. `cert.pem`, gerekiyorsa ara sertifikalarla birlikte full chain olmalı. TLS yenilemesi otomatik değildir; sertifika yenilendiğinde yeniden dağıt.
-
-Terraform state ve plan dosyalarını Git'e ekleme. Ekip kullanımında state'i erişimi kısıtlı Azure Storage backend'ine taşı. API token'ı, arama anahtarı ve TLS private key Terraform değişkenlerine veya cloud-init'e yazılmaz.
-
-## Uygulamayı dağıt
-
-VM'lerde cloud-init Docker kurar. Uygulama dağıtımı ayrı betikle yapılır.
-
-İlk bağlantıda envanterdeki her VM'ye `ssh azureuser@VM_PUBLIC_IP` ile bağlan; SSH fingerprint'ini güvenilir Azure yönetim kanalından doğrulayıp known_hosts'a ekle. Betik host key kontrolünü kapatmaz. VM'ye varsayılan SSH anahtarın veya `--identity` ile verdiğin anahtarla erişilebilmeli.
+Browser için `enable_browser = true` yap, image adresini yaz ve ayrı token sağla:
 
 ```bash
-export GATEWAY_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-export GATEWAY_SEARCH_API_KEY='brave-api-anahtarin'
-
-python scripts/deploy.py \
-  --inventory work/inventory.json \
-  --tls-cert /path/to/cert.pem \
-  --tls-key /path/to/key.pem \
-  --allowed-domain example.com \
-  --allowed-domain api.search.brave.com
+export TF_VAR_browser_token='farkli-en-az-32-karakter-rastgele-token'
 ```
 
-Bu komut yalnızca `work/deploy/` altında paketleri hazırlar. Aynı komuta `--apply` eklemek SSH ile dağıtır. Gerekirse `--identity /path/to/ssh_key` ekle. Token'ı güvenli bir yerde sakla ve sonraki dağıtımlarda aynı değeri kullan; her çalıştırmada yeni token üretmek istemcileri etkiler.
+Aramayı Azure'da açmak için `search_provider = "brave"` ve `TF_VAR_search_api_key` kullan. Terraform API ile worker adresini otomatik bağlar.
 
-Paketlerde token ve TLS anahtarı bulunur. `work/` Git tarafından dışlanır ve paketler yalnızca sahibinin okuyabileceği izinlerle oluşturulur. Paylaşma; dağıtım sonrasında yerel paketleri silebilirsin. VM'deki uygulama dosyaları `/opt/agent-gateway` altındadır ve root tarafından okunur.
+Sırları `.tfvars` veya Git'e yazma. **Sensitive değerler Terraform state ve plan dosyalarında saklanabilir.** Bunları koru; ekip kullanımında erişimi kısıtlı Azure Storage backend kullan. Key Vault entegrasyonu bu sürümde yoktur.
 
-```bash
-curl https://agent-gateway.sirket.com/healthz
-```
+Eski VM'li sürüm Azure'a uygulandıysa aynı state ile yeni plan VM, IP ve load balancer kaynaklarını silmeyi önerebilir. Yeni düzeni ayrı isim ve ayrı state ile kurup doğruladıktan sonra eskisini kaldır. Otomatik/kesintisiz migration yoktur.
 
-Kurum CA'sı kullanıyorsan istemcinin bu CA'ya güvenmesi gerekir. TLS doğrulamasını kapatma.
+## Maliyet ve limitler
 
-## Sayıyı ve IP havuzunu artır
+- API ve browser bağımsız ölçeklenir. Browser'ı yalnızca gerektiğinde çağır.
+- `api_max_replicas` API sınırını belirler; worker maksimum 1'dir.
+- Fetch/arama cache'i süreç belleğinde 60 saniye ve en fazla 32 kayıttır. Fetch `no-store`, `no-cache`, `private` yanıtlarını saklamaz. Kapatmak için `GATEWAY_CACHE_TTL_SECONDS=0`; Terraform'da `cache_ttl_seconds = 0`.
+- Cache restart ve scale-to-zero sonrasında kaybolur. Eşzamanlı aynı istekler birleştirilmez.
+- Rate limit ve cache replica başınadır. Kesin ortak kota için sonradan paylaşımlı store gerekir.
+- Normal fetch sınırı 2 MB/30 saniyedir. Browser render sınırı 45 saniye; en fazla 50 kaynak ve toplam 10 MB indirme. API worker açılışı için 150 saniyeye kadar bekler.
+- Chromium görüntü, video, font, WebSocket, service worker, POST ve login oturumlarını desteklemez. Script/API/CDN domain'leri de açık listede olmalıdır.
+- Scale-to-zero faturanın kesin sıfır olması değildir. Başlangıç/soğuma süresi, trafik, arama, registry ve sonradan açılan log saklama ayrı giderdir.
 
-`infra/terraform.tfvars`:
+Terraform Log Analytics workspace veya ücretli registry oluşturmaz. Environment log hedefi Azure Monitor'dür; kalıcı merkezi saklama için diagnostic settings ayrıca yapılandırılmalıdır. Uygulama stdout logları ACA log stream üzerinden izlenebilir.
 
-```hcl
-api_vm_count     = 1
-proxy_vm_count   = 2
-proxy_ips_per_vm = 2
-```
+## Erişim ve içerik kontrolleri
 
-Bu örnek **1 API VM, 2 Squid VM ve toplam 4 proxy çıkış IP'si** oluşturur. API VM'lerinin yönetim IP'leri ve load balancer IP'si bu sayıya dahil değildir.
+Açık liste tam domain eşleşmesi kullanır. `example.com`, `api.example.com` için izin vermez. Fetch redirect'leri ve browser alt kaynakları kontrol edilir. Private/rezerve IP ve Azure metadata hedefleri reddedilir; bağlantı doğrulanan IP'ye sabitlenir, HTTP Host ve HTTPS SNI korunur.
 
-1. Terraform plan'ını incele ve uygula.
-2. `terraform output -json deployment` ile envanteri yenile.
-3. Yeni VM'lerin SSH host key'lerini doğrula.
-4. Dağıtım betiğini aynı sırlar, sertifika ve domain listesiyle tekrar çalıştır.
+Browser sayfasının HTTP istekleri de doğrulanan HTTP istemcisiyle karşılanır. Bunlar ele geçirilmiş bir container'a karşı ağ seviyesinde izolasyon değildir. Kurumsal agent'ın gateway dışındaki internet erişimini kapatmak kurum ağında ayrıca yapılmalıdır.
 
-Betik önce Squid'leri, ardından API'leri günceller. Proxy listesi tüm API'lere yeniden dağıtılır; servis keşfi veya otomatik autoscale yoktur. İşlemler rolling/zero-downtime garantisi vermez. Özellikle küçültme ve IP sayısı değişimlerini bakım aralığında yap; Terraform silme veya VM yenileme planlayabilir.
-
-### IP seçimi
-
-Her public IP, VM üzerindeki ayrı private IP'ye Azure tarafından eşlenir. Squid'in `3128`, `3129`, `3130`, `3131` portları bu adreslere ayrı bağlanır. Ek private IP'ler işletim sistemine de eklenir ve systemd ile yeniden açılışta korunur.
-
-- `session_id` yoksa istekler yapılandırılmış çıkışlar arasında sırayla gider.
-- Aynı `session_id`, havuz değişmediği sürece aynı çıkışı seçer.
-- Bir proxy ve bir public IP varsa gerçek rotasyon olmaz. İki IP veya ikinci proxy eklemelisin.
-- Proxy hatasında doğrudan internete çıkılmaz. Otomatik sağlık bazlı failover yoktur.
-- Hedef `429` döndürürse `Retry-After` istemciye aktarılır; başka IP ile otomatik tekrar denenmez.
-- Brave kotası API anahtarına da bağlıdır; IP değiştirmek sağlayıcı kotasını artırmaz.
-
-## Ağ sınırları
-
-- API HTTPS erişimi yalnızca `client_cidrs` üzerinden kabul edilir.
-- SSH yalnızca `admin_cidrs` üzerinden kabul edilir.
-- Squid portları yalnızca API subnet'inden erişilebilir; internete açık proxy oluşturulmaz.
-- API'nin `8080` portu yalnızca Azure load balancer sağlık kontrolüne açıktır.
-- API ve Squid aynı açık domain listesini kullanır. Redirect hedefleri tekrar kontrol edilir; Squid bağlantı anında private/rezerve hedefleri de reddeder.
-- Bu sürüm IPv4 proxy çıkışı kullanır; IPv6 hedef erişimi Squid tarafında kapalıdır.
-
-VM'lerin güncelleme ve Docker image indirme için doğrudan outbound erişimi vardır. Uygulamanın web araçları zorunlu olarak Squid kullanır; bu kurulum, VM ele geçirilmesine karşı ağ seviyesinde tam outbound izolasyonu sağlamaz. Kurumsal agent ortamının gateway dışındaki internet erişimini kapatmak da kurum ağında ayrıca yapılmalıdır.
-
-## Bilerek küçük tutulan kapsam
-
-- Tek ortak token; kullanıcı/tenant yönetimi ve Entra ID entegrasyonu yok.
-- Rate limit, round robin ve eşzamanlılık sınırı API süreci başınadır. İki API VM'de toplam kota yaklaşık iki katına çıkar. Ortak limit gerekirse Redis ekle.
-- Veritabanı ve cache yok; ayarlar ortam değişkenlerinden, loglar stdout'tan gelir.
-- `/healthz` yalnızca API'nin ayakta olduğunu gösterir; internet veya proxy sağlık testi değildir.
-- HTTP/HTTPS metin erişimi var; browser automation, dosya indirme, VPN ve TLS inspection yok.
-- VM patch yönetimi, merkezi log saklama, sertifika yenileme ve model entegrasyonları sonraki adımlardır.
+`app/policy.py` içindeki `inspect_input` ve `inspect_output` boş bağlantı noktalarıdır; Content Safety, DLP ve prompt injection modeli henüz bağlı değildir. Entra ID ve tenant yönetimi yoktur.
 
 ## Kontroller
 
 ```bash
-uv sync --frozen
+uv sync --frozen --extra browser
 uv run pytest -q
 uv run ruff check .
-terraform -chdir=infra fmt -check -recursive
 terraform -chdir=infra init -backend=false
 terraform -chdir=infra validate
 terraform -chdir=infra test
 ```
 
-Terraform testleri mock provider kullanır; Azure kaynağı oluşturmaz. Gerçek Azure dağıtımından sonra her çıkışın public IP'sini, kurumun izin verdiği bir IP gösterim servisi üzerinden doğrula.
+Chromium integration testleri sistemde `chromium` varsa çalışır. Terraform testleri mock provider kullanır; Azure kaynağı oluşturmaz.
+
+`session_id` ve yanıttaki `proxy` alanı kaldırıldı. Sayfa yanıtları `url`, `text`, `content_type`, `cache_hit`, `untrusted_content` döndürür. IP havuzu gerektiğinde `WebClient.resource` katmanına eklenebilir.

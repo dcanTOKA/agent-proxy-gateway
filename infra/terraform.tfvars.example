@@ -1,9 +1,11 @@
 subscription_id = "00000000-0000-0000-0000-000000000000"
 location        = "westeurope"
-ssh_public_key  = "ssh-ed25519 AAAA... replace-with-your-public-key"
-admin_cidrs     = ["203.0.113.10/32"]
+api_image       = "ghcr.io/dcantoka/agent-proxy-gateway-api:0.2.0"
 client_cidrs    = ["203.0.113.20/32"]
 
-api_vm_count     = 1
-proxy_vm_count   = 1
-proxy_ips_per_vm = 1
+enable_browser = false
+browser_image  = "ghcr.io/dcantoka/agent-proxy-gateway-browser:0.2.0"
+
+search_provider  = "none"
+cache_ttl_seconds = 60
+api_max_replicas = 2

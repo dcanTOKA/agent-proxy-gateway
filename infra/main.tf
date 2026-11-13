@@ -1,152 +1,152 @@
-locals {
-  api_subnet   = "10.40.1.0/24"
-  proxy_subnet = "10.40.2.0/24"
-  api_nodes    = { for i in range(var.api_vm_count) : tostring(i) => i }
-  proxy_nodes = { for i in range(var.proxy_vm_count) : tostring(i) => {
-    index = i
-    ips   = [for j in range(var.proxy_ips_per_vm) : cidrhost(local.proxy_subnet, 10 + i * 8 + j)]
-  } }
-  proxy_addresses = merge([for key, node in local.proxy_nodes : {
-    for j, ip in node.ips : "${key}-${j}" => { node = key, index = j, ip = ip }
-  }]...)
-  cloud_init = file("${path.module}/cloud-init.yaml")
-}
-
 resource "azurerm_resource_group" "main" {
   name     = var.name
   location = var.location
 }
 
-resource "azurerm_virtual_network" "main" {
-  name                = "${var.name}-vnet"
+resource "azurerm_container_app_environment" "main" {
+  name                = var.name
   location            = var.location
   resource_group_name = azurerm_resource_group.main.name
-  address_space       = ["10.40.0.0/16"]
+  logs_destination    = "azure-monitor"
 }
 
-resource "azurerm_subnet" "api" {
-  name                 = "api"
-  resource_group_name  = azurerm_resource_group.main.name
-  virtual_network_name = azurerm_virtual_network.main.name
-  address_prefixes     = [local.api_subnet]
-}
+resource "azurerm_container_app" "browser" {
+  count                        = var.enable_browser ? 1 : 0
+  name                         = "${var.name}-browser"
+  resource_group_name          = azurerm_resource_group.main.name
+  container_app_environment_id = azurerm_container_app_environment.main.id
+  revision_mode                = "Single"
 
-resource "azurerm_subnet" "proxy" {
-  name                 = "proxy"
-  resource_group_name  = azurerm_resource_group.main.name
-  virtual_network_name = azurerm_virtual_network.main.name
-  address_prefixes     = [local.proxy_subnet]
-}
-
-resource "azurerm_public_ip" "gateway" {
-  name                = "${var.name}-gateway"
-  location            = var.location
-  resource_group_name = azurerm_resource_group.main.name
-  allocation_method   = "Static"
-  sku                 = "Standard"
-}
-
-resource "azurerm_public_ip" "api" {
-  for_each            = local.api_nodes
-  name                = "${var.name}-api-${each.key}"
-  location            = var.location
-  resource_group_name = azurerm_resource_group.main.name
-  allocation_method   = "Static"
-  sku                 = "Standard"
-}
-
-resource "azurerm_public_ip" "proxy" {
-  for_each            = local.proxy_addresses
-  name                = "${var.name}-proxy-${each.key}"
-  location            = var.location
-  resource_group_name = azurerm_resource_group.main.name
-  allocation_method   = "Static"
-  sku                 = "Standard"
-}
-
-resource "azurerm_network_interface" "api" {
-  for_each            = local.api_nodes
-  name                = "${var.name}-api-${each.key}"
-  location            = var.location
-  resource_group_name = azurerm_resource_group.main.name
-  ip_configuration {
-    name                          = "primary"
-    primary                       = true
-    subnet_id                     = azurerm_subnet.api.id
-    private_ip_address_allocation = "Static"
-    private_ip_address            = cidrhost(local.api_subnet, 10 + each.value)
-    public_ip_address_id          = azurerm_public_ip.api[each.key].id
+  lifecycle {
+    precondition {
+      condition     = var.browser_image != "" && length(var.browser_token) >= 32 && var.browser_token != var.api_token
+      error_message = "Browser requires an image and a distinct token of at least 32 characters."
+    }
   }
-}
 
-resource "azurerm_network_interface" "proxy" {
-  for_each            = local.proxy_nodes
-  name                = "${var.name}-proxy-${each.key}"
-  location            = var.location
-  resource_group_name = azurerm_resource_group.main.name
-  dynamic "ip_configuration" {
-    for_each = { for j, ip in each.value.ips : tostring(j) => ip }
-    content {
-      name                          = "ip-${ip_configuration.key}"
-      primary                       = ip_configuration.key == "0"
-      subnet_id                     = azurerm_subnet.proxy.id
-      private_ip_address_allocation = "Static"
-      private_ip_address            = ip_configuration.value
-      public_ip_address_id          = azurerm_public_ip.proxy["${each.key}-${ip_configuration.key}"].id
+  secret {
+    name  = "worker-token"
+    value = var.browser_token
+  }
+
+  template {
+    min_replicas = 0
+    max_replicas = 1
+    http_scale_rule {
+      name                = "browser-requests"
+      concurrent_requests = "1"
+    }
+    container {
+      name   = "browser"
+      image  = var.browser_image
+      cpu    = 1.0
+      memory = "2Gi"
+      env {
+        name        = "GATEWAY_API_TOKEN"
+        secret_name = "worker-token"
+      }
+      env {
+        name  = "GATEWAY_ALLOWED_DOMAINS"
+        value = jsonencode(var.allowed_domains)
+      }
+    }
+  }
+
+  ingress {
+    external_enabled = false
+    target_port      = 8000
+    transport        = "http"
+    traffic_weight {
+      latest_revision = true
+      percentage      = 100
     }
   }
 }
 
-resource "azurerm_linux_virtual_machine" "api" {
-  for_each                        = local.api_nodes
-  name                            = "${var.name}-api-${each.key}"
-  location                        = var.location
-  resource_group_name             = azurerm_resource_group.main.name
-  size                            = var.api_vm_size
-  admin_username                  = var.admin_user
-  disable_password_authentication = true
-  network_interface_ids           = [azurerm_network_interface.api[each.key].id]
-  custom_data                     = base64encode(local.cloud_init)
-  admin_ssh_key {
-    username   = var.admin_user
-    public_key = var.ssh_public_key
-  }
-  os_disk {
-    caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
-  }
-  source_image_reference {
-    publisher = "Canonical"
-    offer     = "ubuntu-24_04-lts"
-    sku       = "server"
-    version   = "latest"
-  }
-  depends_on = [azurerm_subnet_network_security_group_association.api]
-}
+resource "azurerm_container_app" "api" {
+  name                         = "${var.name}-api"
+  resource_group_name          = azurerm_resource_group.main.name
+  container_app_environment_id = azurerm_container_app_environment.main.id
+  revision_mode                = "Single"
 
-resource "azurerm_linux_virtual_machine" "proxy" {
-  for_each                        = local.proxy_nodes
-  name                            = "${var.name}-proxy-${each.key}"
-  location                        = var.location
-  resource_group_name             = azurerm_resource_group.main.name
-  size                            = var.proxy_vm_size
-  admin_username                  = var.admin_user
-  disable_password_authentication = true
-  network_interface_ids           = [azurerm_network_interface.proxy[each.key].id]
-  custom_data                     = base64encode(local.cloud_init)
-  admin_ssh_key {
-    username   = var.admin_user
-    public_key = var.ssh_public_key
+  secret {
+    name  = "api-token"
+    value = var.api_token
   }
-  os_disk {
-    caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
+  secret {
+    name  = "search-key"
+    value = var.search_api_key != "" ? var.search_api_key : "disabled"
   }
-  source_image_reference {
-    publisher = "Canonical"
-    offer     = "ubuntu-24_04-lts"
-    sku       = "server"
-    version   = "latest"
+  secret {
+    name  = "browser-token"
+    value = var.browser_token != "" ? var.browser_token : "disabled"
   }
-  depends_on = [azurerm_subnet_network_security_group_association.proxy]
+
+  lifecycle {
+    precondition {
+      condition     = var.search_provider == "none" || (var.search_api_key != "" && contains(var.allowed_domains, "api.search.brave.com"))
+      error_message = "Brave search requires a key and api.search.brave.com in allowed_domains."
+    }
+  }
+
+  template {
+    min_replicas = 0
+    max_replicas = var.api_max_replicas
+    http_scale_rule {
+      name                = "api-requests"
+      concurrent_requests = "10"
+    }
+    container {
+      name   = "api"
+      image  = var.api_image
+      cpu    = 0.25
+      memory = "0.5Gi"
+      env {
+        name        = "GATEWAY_API_TOKEN"
+        secret_name = "api-token"
+      }
+      env {
+        name  = "GATEWAY_ALLOWED_DOMAINS"
+        value = jsonencode(var.allowed_domains)
+      }
+      env {
+        name  = "GATEWAY_SEARCH_PROVIDER"
+        value = var.search_provider
+      }
+      env {
+        name        = "GATEWAY_SEARCH_API_KEY"
+        secret_name = "search-key"
+      }
+      env {
+        name  = "GATEWAY_BROWSER_URL"
+        value = var.enable_browser ? "https://${azurerm_container_app.browser[0].ingress[0].fqdn}" : ""
+      }
+      env {
+        name        = "GATEWAY_BROWSER_TOKEN"
+        secret_name = "browser-token"
+      }
+      env {
+        name  = "GATEWAY_CACHE_TTL_SECONDS"
+        value = tostring(var.cache_ttl_seconds)
+      }
+    }
+  }
+
+  ingress {
+    external_enabled = true
+    target_port      = 8000
+    transport        = "http"
+    traffic_weight {
+      latest_revision = true
+      percentage      = 100
+    }
+    dynamic "ip_security_restriction" {
+      for_each = toset(var.client_cidrs)
+      content {
+        name             = "corporate-${index(var.client_cidrs, ip_security_restriction.value)}"
+        action           = "Allow"
+        ip_address_range = ip_security_restriction.value
+      }
+    }
+  }
 }

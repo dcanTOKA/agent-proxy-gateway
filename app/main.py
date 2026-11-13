@@ -3,7 +3,7 @@ import json
 import logging
 import secrets
 import time
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
@@ -11,43 +11,35 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl
 
-from app import policy
+from app import browser_client, policy, search
+from app.cache import Cache
 from app.config import Settings
-from app.proxies import ProxyPool
 from app.web import WebClient
 
 logger = logging.getLogger("uvicorn.error")
 bearer = HTTPBearer(auto_error=False)
 
 
-class FetchRequest(BaseModel):
+class PageRequest(BaseModel):
     url: HttpUrl
-    session_id: str | None = Field(default=None, max_length=128)
 
 
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
     max_results: int = Field(default=5, ge=1, le=10)
-    session_id: str | None = Field(default=None, max_length=128)
 
 
-class SearchResult(BaseModel):
-    title: str
-    url: HttpUrl
-    snippet: str
-
-
-class FetchResponse(BaseModel):
+class PageResponse(BaseModel):
     url: str
-    content_type: str
     text: str
-    proxy: str
+    content_type: str = "text/plain"
+    cache_hit: bool = False
     untrusted_content: bool = True
 
 
 class SearchResponse(BaseModel):
-    results: list[SearchResult]
-    proxy: str
+    results: list[search.SearchResult]
+    cache_hit: bool = False
     untrusted_content: bool = True
 
 
@@ -56,28 +48,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         config = settings or Settings()
         app.state.settings = config
-        app.state.pool = ProxyPool(config.proxies)
         app.state.web = WebClient(config)
-        app.state.requests = deque()
+        app.state.cache = Cache(config.cache_ttl_seconds, config.cache_entries)
+        app.state.requests = defaultdict(deque)
         app.state.active = asyncio.Semaphore(config.max_concurrent_requests)
+        app.state.browser_active = asyncio.Semaphore(1)
         yield
 
-    app = FastAPI(title="Agent Gateway", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Agent Gateway", version="0.2.0", lifespan=lifespan)
 
     async def authorize(
         request: Request,
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     ):
-        token = request.app.state.settings.api_token
+        config = request.app.state.settings
         if not credentials or not secrets.compare_digest(
-            credentials.credentials.encode(), token.encode()
+            credentials.credentials.encode(), config.api_token.encode()
         ):
             raise HTTPException(401, "Invalid token", {"WWW-Authenticate": "Bearer"})
+        limit = config.requests_per_minute
+        if request.url.path == "/web-search":
+            limit = config.search_requests_per_minute
+        window = request.app.state.requests[request.url.path]
         now = time.monotonic()
-        window = request.app.state.requests
         while window and window[0] <= now - 60:
             window.popleft()
-        if len(window) >= request.app.state.settings.requests_per_minute:
+        if len(window) >= limit:
             raise HTTPException(429, "Gateway rate limit", {"Retry-After": "60"})
         window.append(now)
 
@@ -104,46 +100,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def health():
         return {"status": "ok"}
 
-    @app.post("/fetch-page", dependencies=[Depends(authorize)], response_model=FetchResponse)
-    async def fetch_page(body: FetchRequest, request: Request):
-        await policy.inspect_input(str(body.url))
-        proxy = request.app.state.pool.choose(body.session_id)
-        async with request.app.state.active:
-            page = await request.app.state.web.fetch(str(body.url), proxy)
+    @app.post("/fetch-page", dependencies=[Depends(authorize)], response_model=PageResponse)
+    async def fetch_page(body: PageRequest, request: Request):
+        url = str(body.url)
+        await policy.inspect_input(url)
+        cache = request.app.state.cache
+        key = ("fetch", url)
+        page = cache.get(key)
+        cached = page is not None
+        if page is None:
+            async with request.app.state.active:
+                page = await request.app.state.web.fetch(url)
+            if page.cacheable:
+                cache.put(key, page)
         await policy.inspect_output(page.text)
-        return FetchResponse(
-            url=page.url, content_type=page.content_type, text=page.text, proxy=proxy.name
+        return PageResponse(
+            url=page.url, text=page.text, content_type=page.content_type, cache_hit=cached
         )
+
+    @app.post("/browse-page", dependencies=[Depends(authorize)], response_model=PageResponse)
+    async def browse_page(body: PageRequest, request: Request):
+        url = str(body.url)
+        await policy.inspect_input(url)
+        await policy.validate_target(url, request.app.state.settings.allowed_domains)
+        async with request.app.state.browser_active:
+            result = await browser_client.browse(url, request.app.state.settings)
+        await policy.inspect_output(result.text)
+        return PageResponse(url=str(result.url), text=result.text)
 
     @app.post("/web-search", dependencies=[Depends(authorize)], response_model=SearchResponse)
     async def web_search(body: SearchRequest, request: Request):
-        settings = request.app.state.settings
-        if not settings.search_api_key:
-            raise HTTPException(503, "Search provider is not configured")
         await policy.inspect_input(body.query)
-        from urllib.parse import urlencode
-
-        query = urlencode({"q": body.query, "count": body.max_results})
-        url = f"https://api.search.brave.com/res/v1/web/search?{query}"
-        proxy = request.app.state.pool.choose(body.session_id)
-        async with request.app.state.active:
-            page = await request.app.state.web.fetch(
-                url, proxy, {"X-Subscription-Token": settings.search_api_key}
-            )
-        try:
-            payload = json.loads(page.text)
-            results = [
-                SearchResult(
-                    title=item.get("title", ""),
-                    url=item["url"],
-                    snippet=item.get("description", ""),
+        key = ("search", body.query, body.max_results)
+        cache = request.app.state.cache
+        results = cache.get(key)
+        cached = results is not None
+        if results is None:
+            async with request.app.state.active:
+                results = await search.search(
+                    body.query,
+                    body.max_results,
+                    request.app.state.settings,
+                    request.app.state.web,
                 )
-                for item in payload.get("web", {}).get("results", [])[: body.max_results]
-            ]
-        except (ValueError, KeyError, TypeError, AttributeError):
-            raise HTTPException(502, "Invalid search provider response") from None
+            cache.put(key, results)
         await policy.inspect_output(json.dumps([item.model_dump(mode="json") for item in results]))
-        return SearchResponse(results=results, proxy=proxy.name)
+        return SearchResponse(results=results, cache_hit=cached)
 
     return app
 

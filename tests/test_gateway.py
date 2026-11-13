@@ -3,10 +3,8 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import Proxy, Settings
+from app.config import Settings
 from app.main import create_app
-from app.policy import is_public_address, validate_target
-from app.proxies import ProxyPool
 from app.web import Page
 
 
@@ -15,7 +13,6 @@ def settings():
     return Settings(
         _env_file=None,
         api_token="a" * 40,
-        proxies=[Proxy(name="one", url="http://10.40.2.10:3128")],
         allowed_domains=["example.com", "api.search.brave.com"],
     )
 
@@ -26,6 +23,9 @@ def client(settings):
         yield client
 
 
+AUTH = {"Authorization": "Bearer " + "a" * 40}
+
+
 def test_token_required_before_network_access(client):
     client.app.state.web.fetch = AsyncMock()
     response = client.post("/fetch-page", json={"url": "https://example.com"})
@@ -33,33 +33,39 @@ def test_token_required_before_network_access(client):
     client.app.state.web.fetch.assert_not_called()
 
 
-def test_fetch_returns_untrusted_text_and_selected_proxy(client):
+def test_fetch_reuses_cached_content(client):
     client.app.state.web.fetch = AsyncMock(
         return_value=Page("https://example.com/", "text/plain", "hello")
     )
-    response = client.post(
-        "/fetch-page",
-        headers={"Authorization": "Bearer " + "a" * 40},
-        json={"url": "https://example.com"},
-    )
-    assert response.status_code == 200
-    assert response.json()["text"] == "hello"
-    assert response.json()["untrusted_content"] is True
-    assert response.json()["proxy"] == "one"
-    assert response.headers["x-request-id"]
+    first = client.post("/fetch-page", headers=AUTH, json={"url": "https://example.com"})
+    second = client.post("/fetch-page", headers=AUTH, json={"url": "https://example.com"})
+    assert first.status_code == second.status_code == 200
+    assert first.json()["cache_hit"] is False
+    assert second.json()["cache_hit"] is True
+    assert second.json()["untrusted_content"] is True
+    assert "proxy" not in second.json()
+    client.app.state.web.fetch.assert_awaited_once()
 
 
-def test_search_requires_provider_configuration(client):
-    response = client.post(
-        "/web-search",
-        headers={"Authorization": "Bearer " + "a" * 40},
-        json={"query": "Azure"},
+def test_no_store_response_is_not_cached(client):
+    client.app.state.web.fetch = AsyncMock(
+        return_value=Page("https://example.com/", "text/plain", "secret", cacheable=False)
     )
+    for _ in range(2):
+        client.post("/fetch-page", headers=AUTH, json={"url": "https://example.com"})
+    assert client.app.state.web.fetch.await_count == 2
+
+
+def test_search_is_opt_in(client):
+    client.app.state.web.fetch = AsyncMock()
+    response = client.post("/web-search", headers=AUTH, json={"query": "Azure"})
     assert response.status_code == 503
+    client.app.state.web.fetch.assert_not_called()
 
 
-def test_search_normalizes_provider_response(settings):
-    settings.search_api_key = "test"
+def test_search_cache_avoids_duplicate_provider_calls(settings):
+    settings.search_provider = "brave"
+    settings.search_api_key = "test-key"
     with TestClient(create_app(settings)) as client:
         client.app.state.web.fetch = AsyncMock(
             return_value=Page(
@@ -69,65 +75,44 @@ def test_search_normalizes_provider_response(settings):
                 '"description":"A result"}]}}',
             )
         )
-        response = client.post(
-            "/web-search",
-            headers={"Authorization": "Bearer " + "a" * 40},
-            json={"query": "Azure", "max_results": 1},
-        )
-        assert response.status_code == 200
-        assert response.json()["results"][0]["snippet"] == "A result"
-        assert client.app.state.web.fetch.call_args.args[2]["X-Subscription-Token"] == "test"
+        for cached in [False, True]:
+            response = client.post("/web-search", headers=AUTH, json={"query": "Azure"})
+            assert response.status_code == 200
+            assert response.json()["cache_hit"] is cached
+        client.app.state.web.fetch.assert_awaited_once()
 
 
-def test_gateway_rate_limit(settings):
-    settings.requests_per_minute = 1
+def test_search_limit_is_separate_from_fetch(settings):
+    settings.search_requests_per_minute = 1
     with TestClient(create_app(settings)) as client:
-        headers = {"Authorization": "Bearer " + "a" * 40}
-        assert client.post("/web-search", headers=headers, json={"query": "x"}).status_code == 503
-        response = client.post("/web-search", headers=headers, json={"query": "x"})
-        assert response.status_code == 429
-        assert response.headers["retry-after"] == "60"
+        client.post("/web-search", headers=AUTH, json={"query": "x"})
+        assert client.post("/web-search", headers=AUTH, json={"query": "x"}).status_code == 429
+        client.app.state.web.fetch = AsyncMock(
+            return_value=Page("https://example.com", "text/plain", "ok")
+        )
+        assert (
+            client.post(
+                "/fetch-page", headers=AUTH, json={"url": "https://example.com"}
+            ).status_code
+            == 200
+        )
 
 
-def test_rotation_and_sticky_session():
-    proxies = [Proxy(name=str(i), url=f"http://10.40.2.10:{3128 + i}") for i in range(3)]
-    pool = ProxyPool(proxies)
-    assert [pool.choose().name for _ in range(4)] == ["0", "1", "2", "0"]
-    assert pool.choose("session-1") == pool.choose("session-1")
-    assert ProxyPool(list(reversed(proxies))).choose("session-1") == pool.choose("session-1")
-
-
-@pytest.mark.parametrize(
-    "address",
-    [
-        "127.0.0.1",
-        "10.1.2.3",
-        "169.254.169.254",
-        "168.63.129.16",
-        "100.64.0.1",
-        "::1",
-        "::ffff:127.0.0.1",
-        "192.0.2.1",
-    ],
-)
-def test_reserved_addresses_blocked(address):
-    assert not is_public_address(address)
-
-
-async def test_private_dns_answer_blocked(monkeypatch):
-    import asyncio
-
-    monkeypatch.setattr(
-        asyncio.get_running_loop(),
-        "getaddrinfo",
-        AsyncMock(return_value=[(2, 1, 6, "", ("10.0.0.1", 443))]),
+def test_browse_delegates_to_separate_worker(client, monkeypatch):
+    monkeypatch.setattr("app.main.policy.validate_target", AsyncMock())
+    render = AsyncMock(
+        return_value=type("Result", (), {"url": "https://example.com", "text": "rendered"})()
     )
-    with pytest.raises(Exception) as error:
-        await validate_target("https://example.com", ["example.com"])
-    assert error.value.status_code == 403
+    monkeypatch.setattr("app.main.browser_client.browse", render)
+    client.app.state.web.fetch = AsyncMock()
+    response = client.post("/browse-page", headers=AUTH, json={"url": "https://example.com"})
+    assert response.status_code == 200
+    assert response.json()["text"] == "rendered"
+    render.assert_awaited_once()
+    client.app.state.web.fetch.assert_not_called()
 
 
-async def test_domain_matching_is_exact():
-    with pytest.raises(Exception) as error:
-        await validate_target("https://example.com.evil.test", ["example.com"])
-    assert error.value.status_code == 403
+def test_browse_is_disabled_when_worker_is_not_configured(client, monkeypatch):
+    monkeypatch.setattr("app.main.policy.validate_target", AsyncMock())
+    response = client.post("/browse-page", headers=AUTH, json={"url": "https://example.com"})
+    assert response.status_code == 503

@@ -15,7 +15,7 @@ def is_public_address(value: str) -> bool:
     return address.is_global and str(address) not in AZURE_INFRASTRUCTURE_IPS
 
 
-async def validate_target(url: str, allowed_domains: list[str]) -> str:
+async def resolve_target(url: str, allowed_domains: list[str]) -> tuple[str, str]:
     try:
         parsed = urlsplit(url)
         host = (parsed.hostname or "").lower().rstrip(".")
@@ -25,8 +25,8 @@ async def validate_target(url: str, allowed_domains: list[str]) -> str:
 
     if parsed.scheme not in ("http", "https") or not host:
         raise HTTPException(422, "Only HTTP and HTTPS URLs are supported")
-    if parsed.username or parsed.password or parsed.fragment:
-        raise HTTPException(422, "URL credentials and fragments are not supported")
+    if parsed.username or parsed.password:
+        raise HTTPException(422, "URL credentials are not supported")
     expected_port = 443 if parsed.scheme == "https" else 80
     if port is not None and port != expected_port:
         raise HTTPException(422, "Only standard HTTP and HTTPS ports are supported")
@@ -41,6 +41,11 @@ async def validate_target(url: str, allowed_domains: list[str]) -> str:
         raise HTTPException(502, "Target DNS lookup failed") from None
     if not addresses or any(not is_public_address(item[4][0]) for item in addresses):
         raise HTTPException(403, "Private and reserved destinations are blocked")
+    return host, addresses[0][4][0]
+
+
+async def validate_target(url: str, allowed_domains: list[str]) -> str:
+    host, _ = await resolve_target(url, allowed_domains)
     return host
 
 

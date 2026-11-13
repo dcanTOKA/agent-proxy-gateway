@@ -1,35 +1,28 @@
-from pydantic import BaseModel, Field, field_validator
+from typing import Literal
+from urllib.parse import urlsplit
+
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-class Proxy(BaseModel):
-    name: str = Field(min_length=1)
-    url: str
-
-    @field_validator("url")
-    @classmethod
-    def validate_url(cls, value: str) -> str:
-        from urllib.parse import urlsplit
-
-        parsed = urlsplit(value)
-        if parsed.scheme != "http" or not parsed.hostname or parsed.username or parsed.password:
-            raise ValueError("Proxy must be an HTTP URL without credentials")
-        if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
-            raise ValueError("Proxy URL must not include a path, query or fragment")
-        return value
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="GATEWAY_", env_file=".env", extra="ignore")
 
     api_token: str = Field(min_length=32)
-    proxies: list[Proxy] = Field(min_length=1)
     allowed_domains: list[str] = Field(min_length=1)
+    search_provider: Literal["none", "brave"] = "none"
     search_api_key: str = ""
+    browser_url: str = ""
+    browser_token: str = ""
+    chromium_executable: str | None = None
+    browser_timeout_seconds: float = Field(default=150, gt=0, le=180)
     requests_per_minute: int = Field(default=60, ge=1)
-    timeout_seconds: float = Field(default=30, gt=0, le=120)
-    max_response_bytes: int = Field(default=2_000_000, ge=1024, le=10_000_000)
-    max_concurrent_requests: int = Field(default=20, ge=1, le=200)
+    search_requests_per_minute: int = Field(default=10, ge=1)
+    timeout_seconds: float = Field(default=30, gt=0, le=60)
+    max_response_bytes: int = Field(default=2_000_000, ge=1024, le=5_000_000)
+    max_concurrent_requests: int = Field(default=10, ge=1, le=100)
+    cache_ttl_seconds: int = Field(default=60, ge=0, le=3600)
+    cache_entries: int = Field(default=32, ge=1, le=128)
 
     @field_validator("allowed_domains")
     @classmethod
@@ -39,9 +32,18 @@ class Settings(BaseSettings):
             raise ValueError("Use explicit domain names without wildcards, schemes or ports")
         return normalized
 
-    @field_validator("proxies")
+    @field_validator("browser_url")
     @classmethod
-    def unique_proxy_names(cls, proxies: list[Proxy]) -> list[Proxy]:
-        if len({proxy.name for proxy in proxies}) != len(proxies):
-            raise ValueError("Proxy names must be unique")
-        return proxies
+    def validate_browser_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if value and (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in ("", "/")
+        ):
+            raise ValueError("Browser URL must be an HTTP(S) origin without credentials")
+        return value.rstrip("/")
