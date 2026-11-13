@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      - squid
+    restart: unless-stopped
+  squid:
+    build: ./deploy/squid
+    volumes:
+      - ./deploy/squid.local.conf:/etc/squid/squid.conf:ro
+    restart: unless-stopped

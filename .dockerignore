@@ -1,0 +1,11 @@
+.git
+.env
+.venv
+tests
+infra
+work
+dist
+__pycache__
+tls
+*.pem
+*.key
